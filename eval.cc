@@ -17,6 +17,7 @@
 #include "eval.h"
 
 #include <errno.h>
+#include <pthread.h>
 #include <string.h>
 
 #include "expr.h"
@@ -38,6 +39,18 @@ Evaluator::Evaluator()
       posix_sym_(Intern(".POSIX")),
       is_posix_(false),
       kati_readonly_(Intern(".KATI_READONLY")) {
+#if defined(__APPLE__)
+  stack_size_ = pthread_get_stacksize_np(pthread_self());
+  stack_addr_ = (char*)pthread_get_stackaddr_np(pthread_self()) - stack_size_;
+#else
+  pthread_attr_t attr;
+  CHECK(pthread_getattr_np(pthread_self(), &attr) == 0);
+  CHECK(pthread_attr_getstack(&attr, &stack_addr_, &stack_size_) == 0);
+  CHECK(pthread_attr_destroy(&attr) == 0);
+#endif
+
+  lowest_stack_ = (char*)stack_addr_ + stack_size_;
+  LOG_STAT("Stack size: %zd bytes", stack_size_);
 }
 
 Evaluator::~Evaluator() {
@@ -47,31 +60,40 @@ Evaluator::~Evaluator() {
   // }
 }
 
-Var* Evaluator::EvalRHS(Symbol lhs, Value* rhs_v, StringPiece orig_rhs,
-                        AssignOp op, bool is_override) {
-  VarOrigin origin = (
-      (is_bootstrap_ ? VarOrigin::DEFAULT :
-       is_commandline_ ? VarOrigin::COMMAND_LINE :
-       is_override ? VarOrigin::OVERRIDE : VarOrigin::FILE));
+Var* Evaluator::EvalRHS(Symbol lhs,
+                        Value* rhs_v,
+                        StringPiece orig_rhs,
+                        AssignOp op,
+                        bool is_override) {
+  VarOrigin origin =
+      ((is_bootstrap_ ? VarOrigin::DEFAULT
+                      : is_commandline_ ? VarOrigin::COMMAND_LINE
+                                        : is_override ? VarOrigin::OVERRIDE
+                                                      : VarOrigin::FILE));
 
   Var* rhs = NULL;
+  Var* prev = NULL;
   bool needs_assign = true;
+
   switch (op) {
     case AssignOp::COLON_EQ: {
+      prev = PeekVarInCurrentScope(lhs);
       SimpleVar* sv = new SimpleVar(origin);
       rhs_v->Eval(this, sv->mutable_value());
       rhs = sv;
       break;
     }
     case AssignOp::EQ:
+      prev = PeekVarInCurrentScope(lhs);
       rhs = new RecursiveVar(rhs_v, origin, orig_rhs);
       break;
     case AssignOp::PLUS_EQ: {
-      Var* prev = LookupVarInCurrentScope(lhs);
+      prev = LookupVarInCurrentScope(lhs);
       if (!prev->IsDefined()) {
         rhs = new RecursiveVar(rhs_v, origin, orig_rhs);
       } else if (prev->ReadOnly()) {
-        Error(StringPrintf("*** cannot assign to readonly variable: %s", lhs.c_str()));
+        Error(StringPrintf("*** cannot assign to readonly variable: %s",
+                           lhs.c_str()));
       } else {
         prev->AppendVar(this, rhs_v);
         rhs = prev;
@@ -80,7 +102,7 @@ Var* Evaluator::EvalRHS(Symbol lhs, Value* rhs_v, StringPiece orig_rhs,
       break;
     }
     case AssignOp::QUESTION_EQ: {
-      Var* prev = LookupVarInCurrentScope(lhs);
+      prev = LookupVarInCurrentScope(lhs);
       if (!prev->IsDefined()) {
         rhs = new RecursiveVar(rhs_v, origin, orig_rhs);
       } else {
@@ -88,6 +110,15 @@ Var* Evaluator::EvalRHS(Symbol lhs, Value* rhs_v, StringPiece orig_rhs,
         needs_assign = false;
       }
       break;
+    }
+  }
+
+  if (prev != NULL) {
+    prev->Used(this, lhs);
+    if (prev->Deprecated()) {
+      if (needs_assign) {
+        rhs->SetDeprecated(prev->DeprecatedMessage());
+      }
     }
   }
 
@@ -111,7 +142,8 @@ void Evaluator::EvalAssign(const AssignStmt* stmt) {
     for (auto const& name : WordScanner(rhs)) {
       Var* var = Intern(name).GetGlobalVar();
       if (!var->IsDefined()) {
-        Error(StringPrintf("*** unknown variable: %s", name.as_string().c_str()));
+        Error(
+            StringPrintf("*** unknown variable: %s", name.as_string().c_str()));
       }
       var->SetReadOnly();
     }
@@ -122,11 +154,11 @@ void Evaluator::EvalAssign(const AssignStmt* stmt) {
                      stmt->directive == AssignDirective::OVERRIDE);
   if (rhs) {
     bool readonly;
-    lhs.SetGlobalVar(rhs,
-                     stmt->directive == AssignDirective::OVERRIDE,
+    lhs.SetGlobalVar(rhs, stmt->directive == AssignDirective::OVERRIDE,
                      &readonly);
     if (readonly) {
-      Error(StringPrintf("*** cannot assign to readonly variable: %s", lhs.c_str()));
+      Error(StringPrintf("*** cannot assign to readonly variable: %s",
+                         lhs.c_str()));
     }
   }
 }
@@ -145,7 +177,7 @@ void Evaluator::EvalRule(const RuleStmt* stmt) {
 
   Rule* rule;
   RuleVarAssignment rule_var;
-  function<string()> after_term_fn = [this, stmt](){
+  function<string()> after_term_fn = [this, stmt]() {
     return stmt->after_term ? stmt->after_term->Eval(this) : "";
   };
   ParseRule(loc_, expr, stmt->term, after_term_fn, &rule, &rule_var);
@@ -197,7 +229,8 @@ void Evaluator::EvalRule(const RuleStmt* stmt) {
       for (auto const& name : WordScanner(rhs_value)) {
         Var* var = current_scope_->Lookup(Intern(name));
         if (!var->IsDefined()) {
-          Error(StringPrintf("*** unknown variable: %s", name.as_string().c_str()));
+          Error(StringPrintf("*** unknown variable: %s",
+                             name.as_string().c_str()));
         }
         var->SetReadOnly();
       }
@@ -210,7 +243,8 @@ void Evaluator::EvalRule(const RuleStmt* stmt) {
       bool readonly;
       current_scope_->Assign(lhs, new RuleVar(rhs_var, rule_var.op), &readonly);
       if (readonly) {
-        Error(StringPrintf("*** cannot assign to readonly variable: %s", lhs.c_str()));
+        Error(StringPrintf("*** cannot assign to readonly variable: %s",
+                           lhs.c_str()));
       }
     }
     current_scope_ = NULL;
@@ -275,6 +309,8 @@ void Evaluator::EvalIf(const IfStmt* stmt) {
 }
 
 void Evaluator::DoInclude(const string& fname) {
+  CheckStack();
+
   Makefile* mk = MakefileCacheManager::Get()->ReadMakefile(fname);
   if (!mk->Exists()) {
     Error(StringPrintf("%s does not exist", fname.c_str()));
@@ -362,6 +398,13 @@ Var* Evaluator::LookupVarInCurrentScope(Symbol name) {
   return LookupVarGlobal(name);
 }
 
+Var* Evaluator::PeekVarInCurrentScope(Symbol name) {
+  if (current_scope_) {
+    return current_scope_->Peek(name);
+  }
+  return name.PeekGlobalVar();
+}
+
 string Evaluator::EvalVar(Symbol name) {
   return LookupVar(name)->Eval(this);
 }
@@ -384,6 +427,12 @@ string Evaluator::GetShellAndFlag() {
 
 void Evaluator::Error(const string& msg) {
   ERROR_LOC(loc_, "%s", msg.c_str());
+}
+
+void Evaluator::DumpStackStats() const {
+  LOG_STAT("Max stack use: %zd bytes at %s:%d",
+           ((char*)stack_addr_ - (char*)lowest_stack_) + stack_size_,
+           LOCF(lowest_loc_));
 }
 
 unordered_set<Symbol> Evaluator::used_undefined_vars_;
