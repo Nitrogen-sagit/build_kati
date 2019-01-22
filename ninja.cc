@@ -530,7 +530,9 @@ class NinjaGenerator {
         case ':':
         case ' ':
           r += '$';
-        // fall through.
+#if defined(__has_cpp_attribute) && __has_cpp_attribute(clang::fallthrough)
+          [[clang::fallthrough]];
+#endif
         default:
           r += c;
       }
@@ -600,14 +602,16 @@ class NinjaGenerator {
       fprintf(fp_, "\n");
     }
 
-    if (g_flags.ninja_dir) {
-      fprintf(fp_, "builddir = %s\n\n", g_flags.ninja_dir);
+    if (!g_flags.no_ninja_prelude) {
+      if (g_flags.ninja_dir) {
+        fprintf(fp_, "builddir = %s\n\n", g_flags.ninja_dir);
+      }
+
+      fprintf(fp_, "pool local_pool\n");
+      fprintf(fp_, " depth = %d\n\n", g_flags.num_jobs);
+
+      fprintf(fp_, "build _kati_always_build_: phony\n\n");
     }
-
-    fprintf(fp_, "pool local_pool\n");
-    fprintf(fp_, " depth = %d\n\n", g_flags.num_jobs);
-
-    fprintf(fp_, "build _kati_always_build_: phony\n\n");
 
     unique_ptr<ThreadPool> tp(NewThreadPool(g_flags.num_jobs));
     CHECK(g_flags.num_jobs);
@@ -625,8 +629,10 @@ class NinjaGenerator {
     }
     tp->Wait();
 
-    for (const ostringstream& buf : bufs) {
-      fprintf(fp_, "%s", buf.str().c_str());
+    if (!g_flags.generate_empty_ninja) {
+      for (const ostringstream& buf : bufs) {
+        fprintf(fp_, "%s", buf.str().c_str());
+      }
     }
 
     SymbolSet used_env_vars(Vars::used_env_vars());
@@ -648,8 +654,10 @@ class NinjaGenerator {
         default_targets += EscapeBuildTarget(s);
       }
     }
-    fprintf(fp_, "\n");
-    fprintf(fp_, "default %s\n", default_targets.c_str());
+    if (!g_flags.generate_empty_ninja) {
+      fprintf(fp_, "\n");
+      fprintf(fp_, "default %s\n", default_targets.c_str());
+    }
 
     fclose(fp_);
   }

@@ -23,6 +23,7 @@
 #include <mutex>
 #include <vector>
 
+#include "affinity.h"
 #include "fileutil.h"
 #include "find.h"
 #include "func.h"
@@ -442,6 +443,7 @@ class StampChecker {
     tp->Submit([this]() {
       string err;
       // TODO: Make glob cache thread safe and create a task for each glob.
+      SetAffinityForSingleThread();
       for (GlobResult* gr : globs_) {
         if (CheckGlobResult(gr, &err)) {
           unique_lock<mutex> lock(mu_);
@@ -455,6 +457,7 @@ class StampChecker {
     });
 
     tp->Submit([this]() {
+      SetAffinityForSingleThread();
       for (ShellResult* sr : commands_) {
         string err;
         if (CheckShellResult(sr, &err)) {
